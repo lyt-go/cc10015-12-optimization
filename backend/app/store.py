@@ -29,6 +29,8 @@ class Store:
         self._tables = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        # 补传领取回执单独成表：一条失败传输最多一份领取回执，重复提交只更新不追加。
+        self._tables.setdefault("supplement_claim", [])
         self._idempotent_keys.clear()
         self._rollback_log.clear()
 
@@ -42,6 +44,15 @@ class Store:
             if key not in self._locks:
                 self._locks[key] = threading.Lock()
             return self._locks[key]
+
+    def lock_for(self, key: str) -> threading.Lock:
+        """返回业务 key 对应的可重入之外的互斥锁，供跨记录事务串行化。"""
+        return self._get_lock(key)
+
+    def next_id(self, module: str) -> int:
+        """返回模块下一条记录可用的自增 id。"""
+        rows = self.rows(module)
+        return max((int(row.get("id", 0)) for row in rows), default=0) + 1
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)

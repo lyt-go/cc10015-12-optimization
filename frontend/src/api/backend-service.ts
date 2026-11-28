@@ -65,3 +65,70 @@ export async function fetchSnapshot(key: string): Promise<Record<string, any>> {
   if (!response.ok) throw new Error('跨模块快照读取失败')
   return await response.json()
 }
+
+export type SupplementCandidate = {
+  id: number
+  attempt_id: string
+  '航次编号': string
+  '数据内容': string
+  '目标系统': string
+  '轮次': number
+  retry_eligible: boolean
+  claimed: boolean
+  '领取回执号'?: string | null
+  '已有进行中轮次'?: boolean
+  [field: string]: unknown
+}
+
+export type SupplementSummary = {
+  items: SupplementCandidate[]
+  total: number
+  by_target: Record<string, number>
+}
+
+export type SupplementInfo = {
+  report_id: number
+  '航次编号': string
+  '补件状态'?: string
+  credential: Record<string, any> | null
+  receipts: Record<string, any>[]
+  '最近失败传输': Record<string, any> | null
+  '科研归档接收'?: Record<string, any> | null
+}
+
+export async function listSupplementCandidates(
+  params: Record<string, string> = {},
+): Promise<SupplementSummary> {
+  const query = new URLSearchParams(params).toString()
+  const response = await request(`/api/data_transfer/candidates?${query}`)
+  if (!response.ok) throw new Error('补传候选读取失败')
+  return await response.json()
+}
+
+export async function claimSupplement(
+  id: number,
+  values: Record<string, unknown> = {},
+): Promise<ActionResult> {
+  const response = await request(`/api/data_transfer/${id}/claim`, {
+    method: 'POST',
+    body: JSON.stringify({ values }),
+  })
+  return await response.json()
+}
+
+export async function replayLateConfirmation(
+  id: number,
+  values: Record<string, unknown> = {},
+): Promise<ActionResult> {
+  const response = await request(`/api/data_transfer/${id}/late-confirmation`, {
+    method: 'POST',
+    body: JSON.stringify({ values }),
+  })
+  return await response.json()
+}
+
+export async function fetchSupplementInfo(reportId: number): Promise<SupplementInfo> {
+  const response = await request(`/api/results_compile/${reportId}/supplement`)
+  if (!response.ok) throw new Error('汇编报告补件信息读取失败')
+  return await response.json()
+}

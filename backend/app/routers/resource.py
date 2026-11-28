@@ -140,6 +140,74 @@ def cross_links() -> dict[str, Any]:
     return {"links": links}
 
 
+@router.get("/data_transfer/candidates")
+def data_transfer_candidates(
+    report_id: int | None = Query(default=None),
+    voyage: str | None = Query(default=None),
+    target: str | None = Query(default=None),
+    data_content: str | None = Query(default=None),
+    include_claimed: bool = Query(default=False),
+) -> dict[str, Any]:
+    """补传候选队列：只列已失败、在本目标系统仍有重试资格的传输。
+
+    ``report_id`` 按该汇编报告的航次收敛候选；科研归档端和岸端分别核对。
+    """
+    service = require_service("data_transfer")
+    return service.candidate_summary(
+        report_id=report_id,
+        voyage=voyage,
+        target=target,
+        data_content=data_content,
+        include_claimed=include_claimed,
+    )
+
+
+@router.get("/data_transfer/claims")
+def data_transfer_claims() -> dict[str, Any]:
+    """补传领取回执列表。"""
+    rows = store.rows("supplement_claim")
+    return {"items": rows, "total": len(rows)}
+
+
+@router.post("/data_transfer/{entry_id}/claim")
+def claim_data_transfer(entry_id: int, payload: EntryPayload) -> ActionResult:
+    """领取补传任务，重复提交只记一次。"""
+    service = require_service("data_transfer")
+    values = payload.values or {}
+    claim, message, _duplicate = service.claim_supplement(
+        entry_id,
+        report_id=int(values["报告id"]) if values.get("报告id") not in (None, "") else None,
+        operator=str(values.get("值班员") or values.get("操作人") or "岸端值班员"),
+        receipt_id=str(values["回执号"]) if values.get("回执号") else None,
+        target=str(values["目标系统"]) if values.get("目标系统") else None,
+        idempotency_token=str(values["idempotency_token"]) if values.get("idempotency_token") else None,
+    )
+    return ActionResult(ok=claim is not None, message=message, entry=claim)
+
+
+@router.post("/data_transfer/{entry_id}/late-confirmation")
+def late_confirmation(entry_id: int, payload: EntryPayload | None = None) -> ActionResult:
+    """旧连接恢复后回放迟到的成功确认。"""
+    service = require_service("data_transfer")
+    values = (payload.values if payload else {}) or {}
+    entry, message, _late = service.replay_late_confirmation(
+        entry_id,
+        report_id=int(values["报告id"]) if values.get("报告id") not in (None, "") else None,
+        confirmed_at=str(values["确认时间"]) if values.get("确认时间") else None,
+    )
+    return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+
+@router.get("/results_compile/{entry_id}/supplement")
+def results_compile_supplement(entry_id: int) -> dict[str, Any]:
+    """汇编报告补件视图：当前唯一有效凭据、补传回执、失败传输定位。"""
+    service = require_service("results_compile")
+    info = service.supplement_info(entry_id)
+    if info is None:
+        raise HTTPException(status_code=404, detail=f"汇编报告 {entry_id} 不存在或已归档")
+    return info
+
+
 @router.get("/{module}", response_model=PageResult[dict])
 def list_entries(
     module: str,

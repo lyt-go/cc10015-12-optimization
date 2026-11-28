@@ -28,6 +28,58 @@
       </span>
     </p>
 
+    <!-- 补传候选队列：只在数据传输模块出现，按目标系统分组给岸端值班员定位 -->
+    <section v-if="meta.key === 'data_transfer'" class="supplement-panel" data-testid="supplement-candidates">
+      <header class="supplement-head">
+        <h3>补传候选队列（{{ candidateSummary.total }} 条）</h3>
+        <span class="hint">只列已失败且仍有重试资格的传输；科研归档端与岸端分别核对</span>
+      </header>
+      <div class="supplement-groups">
+        <article v-for="(count, target) in candidateSummary.by_target" :key="target" class="supplement-group">
+          <h4>{{ target }}：{{ count }} 条</h4>
+          <ul>
+            <li v-for="candidate in candidatesFor(target)" :key="candidate.id" :data-testid="`candidate-${candidate.id}`">
+              <span class="candidate-main">{{ candidate['数据内容'] }} · 第{{ candidate['轮次'] }}轮 · {{ candidate.attempt_id }}</span>
+              <span class="candidate-meta">
+                航次 {{ candidate['航次编号'] || '—' }} · 回执 {{ candidate['领取回执号'] || '未领取' }}
+              </span>
+              <button class="link" type="button" :data-testid="`claim-${candidate.id}`" @click="claimCandidate(candidate)">
+                领取补传
+              </button>
+            </li>
+          </ul>
+        </article>
+        <p v-if="!candidateSummary.total" class="empty-state">当前没有可办理的补传候选</p>
+      </div>
+    </section>
+
+    <!-- 汇编报告补件凭据：只在成果汇编模块出现 -->
+    <section v-if="meta.key === 'results_compile' && supplementInfo" class="supplement-panel" data-testid="supplement-credential">
+      <header class="supplement-head">
+        <h3>报告 #{{ supplementInfo.report_id }} 补件凭据</h3>
+        <span class="hint">{{ supplementInfo['补件状态'] || '尚未办理补传' }}</span>
+      </header>
+      <p v-if="supplementInfo.credential" class="credential-line">
+        当前唯一有效凭据：{{ supplementInfo.credential['来源'] }} · {{ supplementInfo.credential['attempt_id'] }}
+        · 第{{ supplementInfo.credential['轮次'] }}轮 · {{ supplementInfo.credential['目标系统'] }}
+        <span v-if="supplementInfo.credential['重复来件']">（重复来件，未重复核收）</span>
+      </p>
+      <p v-else class="hint">尚无岸端接收凭据</p>
+      <p v-if="supplementInfo['科研归档接收']" class="hint">
+        科研归档端已收到（{{ supplementInfo['科研归档接收']['attempt_id'] }}），不能替代岸端接收
+      </p>
+      <p v-if="supplementInfo['最近失败传输']" class="hint">
+        实际失败传输：{{ supplementInfo['最近失败传输']['传输记录id'] }}（{{ supplementInfo['最近失败传输']['目标系统'] }}，
+        {{ supplementInfo['最近失败传输']['attempt_id'] }}）
+      </p>
+      <ul class="receipt-list">
+        <li v-for="receipt in supplementInfo.receipts" :key="String(receipt['回执号'])">
+          回执 {{ receipt['回执号'] }} · {{ receipt['办理状态'] }}
+          <span v-if="receipt['冲突说明']">· {{ receipt['冲突说明'] }}</span>
+        </li>
+      </ul>
+    </section>
+
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
@@ -85,7 +137,17 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { createEntry, downloadEntries, listEntries, moduleMeta, runAction as applyAction } from '@/api/backend-service'
+import {
+  claimSupplement,
+  createEntry,
+  downloadEntries,
+  fetchSupplementInfo,
+  listEntries,
+  listSupplementCandidates,
+  moduleMeta,
+  runAction as applyAction,
+} from '@/api/backend-service'
+import type { SupplementInfo, SupplementSummary } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
@@ -98,6 +160,8 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const candidateSummary = ref<SupplementSummary>({ items: [], total: 0, by_target: {} })
+const supplementInfo = ref<SupplementInfo | null>(null)
 
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
@@ -108,6 +172,29 @@ const stats = computed(() => [
 const statusSummary = computed(() =>
   meta.statuses.map((s) => ({ status: s, count: rows.value.filter((r) => String(r.status) === s).length })),
 )
+
+function candidatesFor(target: string) {
+  return candidateSummary.value.items.filter((item) => String(item['目标系统'] || '未指定') === target)
+}
+
+async function loadSupplement() {
+  if (meta.key === 'data_transfer') {
+    candidateSummary.value = await listSupplementCandidates()
+  } else if (meta.key === 'results_compile') {
+    // 优先展示需补充 / 有补件记录的报告，没有就退回第一条
+    const target = rows.value.find((r) => r.status === '需补充') ?? rows.value.find((r) => Number(r.id) > 0)
+    supplementInfo.value = target ? await fetchSupplementInfo(Number(target.id)) : null
+  }
+}
+
+async function claimCandidate(candidate: { id: number }) {
+  errorMessage.value = ''
+  try {
+    const r = await claimSupplement(candidate.id, { 值班员: '岸端值班员' })
+    if (!r.ok) throw new Error(r.message)
+    await reload()
+  } catch (e) { errorMessage.value = e instanceof Error ? e.message : '领取补传失败' }
+}
 
 function resetFilters() { filters.value = {}; void reload() }
 
@@ -146,6 +233,7 @@ async function reload() {
   try {
     const payload = await listEntries(meta.key, filters.value)
     rows.value = payload.items; total.value = payload.total
+    await loadSupplement()
   } catch (e) { errorMessage.value = e instanceof Error ? e.message : '业务列表读取失败' }
 }
 
@@ -153,6 +241,19 @@ onMounted(reload)
 </script>
 
 <style scoped>
+.supplement-panel { border:1px solid var(--border-color,#e2e8f0); border-radius:8px; padding:16px; margin-bottom:16px; background:#f8fafc; }
+.supplement-head { display:flex; justify-content:space-between; align-items:baseline; gap:12px; }
+.supplement-head h3 { margin:0 0 8px; font-size:15px; }
+.supplement-groups { display:flex; flex-wrap:wrap; gap:16px; }
+.supplement-group { min-width:280px; flex:1; }
+.supplement-group h4 { margin:0 0 6px; font-size:13px; color:var(--text-secondary,#4a5568); }
+.supplement-group ul { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:8px; }
+.supplement-group li { display:flex; flex-direction:column; gap:2px; background:#fff; border:1px solid var(--border-color,#e2e8f0); border-radius:6px; padding:8px 10px; }
+.candidate-main { font-size:13px; }
+.candidate-meta { font-size:12px; color:var(--text-secondary,#4a5568); }
+.hint { font-size:12px; color:var(--text-secondary,#4a5568); }
+.credential-line { font-size:13px; margin:8px 0; }
+.receipt-list { list-style:none; margin:8px 0 0; padding:0; font-size:12px; color:var(--text-secondary,#4a5568); }
 .modal-backdrop { position:fixed; inset:0; background:rgba(0,0,0,.35); display:flex; align-items:center; justify-content:center; z-index:100; }
 .modal { background:#fff; border-radius:8px; padding:24px; width:480px; max-height:80vh; overflow-y:auto; }
 .create-field { display:flex; flex-direction:column; gap:4px; margin-bottom:12px; }

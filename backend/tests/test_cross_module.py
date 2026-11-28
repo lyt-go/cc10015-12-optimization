@@ -639,3 +639,123 @@ def test_full_cross_module_chain():
     _samples("analysis_request")[0]["status"] = "已提交"
     entry, msg = analysis_svc.run_action(1, "批准分析")
     assert entry is not None, "样品已入库，应批准成功"
+
+# ============================================================
+# 测试16：补传候选队列 -> 领取 -> 迟到确认 -> 报告补件凭据
+# ============================================================
+def _seed_voyage(voyage: str = "CRUISE-SUP-01") -> int:
+    """准备一份需补充的汇编报告，以及温盐包在科研归档端 / 岸端的失败记录。"""
+    report_id = 9001
+    store.rows("results_compile").append({
+        "id": report_id, "status": "需补充", "pending": True, "abnormal": True,
+        "航次编号": voyage, "成果类别": "温盐成果", "主要发现": "温盐包待补传",
+        "数据完整度": "温盐包缺失", "汇编人": "汇编员", "完成日期": "", "备注说明": "",
+    })
+    base = {
+        "status": "已失败", "pending": False, "abnormal": True,
+        "数据内容": "温盐包", "数据量": "1.2GB", "传输方式": "卫星",
+        "传输状态": "失败", "操作人": "数据工程师", "传输时间": "2026-11-20",
+        "备注说明": "链路中断", "航次编号": voyage, "报告id": report_id,
+    }
+    store.rows("data_transfer").extend([
+        {"id": 9101, "目标系统": "岸端接收系统", **base},
+        {"id": 9102, "目标系统": "科研归档端", **base},
+    ])
+    # 一条未失败、仍在传输中的轮次，任何情况下都不能出现在候选里
+    store.rows("data_transfer").append({
+        "id": 9103, "status": "传输中", "pending": True, "abnormal": False,
+        "数据内容": "海流包", "数据量": "800MB", "传输方式": "卫星",
+        "目标系统": "岸端接收系统", "传输状态": "传输中", "操作人": "数据工程师",
+        "传输时间": "2026-11-21", "备注说明": "", "航次编号": voyage, "报告id": report_id,
+    })
+    return report_id
+
+
+def test_supplement_candidates_split_by_target_system():
+    from app.services.data_transfer import DataTransferService
+    svc = DataTransferService()
+    report_id = _seed_voyage()
+
+    shore = svc.list_candidates(report_id=report_id, target="岸端接收系统")
+    archive = svc.list_candidates(report_id=report_id, target="科研归档端")
+    assert [item["id"] for item in shore] == [9101]
+    assert [item["id"] for item in archive] == [9102]
+
+    # 未失败且仍活动的一轮（9103）不能被候选查询列作可重试
+    assert 9103 not in [item["id"] for item in svc.list_candidates(report_id=report_id)]
+
+    # 科研归档端已收到不能替代岸端接收：归档端完成不消除岸端候选
+    svc.replay_late_confirmation(9102)
+    assert [item["id"] for item in svc.list_candidates(report_id=report_id, target="岸端接收系统")] == [9101]
+
+
+def test_supplement_claim_is_idempotent_and_scoped_per_attempt():
+    from app.services.data_transfer import DataTransferService
+    from app.services.results_compile import ResultsCompileService
+    svc = DataTransferService()
+    rc = ResultsCompileService()
+    report_id = _seed_voyage()
+
+    claim, msg, duplicate = svc.claim_supplement(9101, report_id=report_id, operator="值班员甲")
+    assert claim is not None and duplicate is False
+    assert claim["轮次"] == 2
+
+    again, msg2, duplicate2 = svc.claim_supplement(9101, report_id=report_id, operator="值班员甲")
+    assert duplicate2 is True and again["回执号"] == claim["回执号"]
+    # 重复提交只记一次：只有一份领取回执、一份新尝试，报告只挂一份回执
+    assert len(store.rows("supplement_claim")) == 1
+    assert len(store.find_by("data_transfer", "原传输记录id", 9101)) == 1
+    assert len(store.find("results_compile", report_id)["补传回执"]) == 1
+
+    # 已领取的失败记录不再出现在候选队列
+    assert 9101 not in [item["id"] for item in svc.list_candidates(report_id=report_id)] 
+
+    # 领取卡住时旧连接迟到确认：原传输完成，领取出来的新尝试作废，报告记录的是原传输
+    original, msg3, late = svc.replay_late_confirmation(9101)
+    assert late is True and original["status"] == "已完成"
+    successor = store.find("data_transfer", claim["新尝试记录id"])
+    assert successor["status"] == "已取消" and successor["被取代"] is True
+
+    info = rc.supplement_info(report_id)
+    assert info["补件凭据"]["来源"] == "原传输"
+    assert info["补件凭据"]["attempt_id"] == claim["原传输尝试"]
+    assert info["补件凭据"]["有效"] is True
+    assert info["补传回执"][0]["办理状态"] == "冲突作废"
+
+
+def test_supplement_credential_single_attempt_and_return_keeps_locator():
+    from app.services.data_transfer import DataTransferService
+    from app.services.results_compile import ResultsCompileService
+    svc = DataTransferService()
+    rc = ResultsCompileService()
+    report_id = _seed_voyage()
+
+    claim, _, _ = svc.claim_supplement(9101, report_id=report_id)
+    successor = store.find("data_transfer", claim["新尝试记录id"])
+    assert successor["status"] == "待传输"
+    entry, msg = svc.run_action(successor["id"], "确认完成")
+    assert entry is not None and entry["status"] == "已完成"
+
+    info = rc.supplement_info(report_id)
+    assert info["补件凭据"]["来源"] == "领取补传"
+    assert info["补件凭据"]["attempt_id"] == successor["attempt_id"]
+    assert info["补件凭据"]["轮次"] == 2
+    assert info["补传回执"][0]["办理状态"] == "已接收"
+
+    # 原传输的迟到确认后到：报告只核收本次尝试的一份资料，凭据不被顶掉
+    svc.replay_late_confirmation(9101)
+    info = rc.supplement_info(report_id)
+    assert info["补件凭据"]["attempt_id"] == successor["attempt_id"]
+    repeated = [h for h in info["补件凭据记录"] if h.get("重复来件")]
+    assert repeated and repeated[0]["attempt_id"] == claim["原传输尝试"]
+    assert info["补件凭据记录"].count(info["补件凭据"]) >= 1
+
+    # 退回补充后，报告仍能定位实际失败的传输和领取回执
+    rc.run_action(report_id, "退回补充")
+    info = rc.supplement_info(report_id)
+    assert info["补件凭据"]["attempt_id"] == successor["attempt_id"]
+    assert info["最近失败传输"]["传输记录id"] == 9101
+    assert len(info["补传回执"]) == 1
+
+    # 科研归档端的失败项仍然在候选里（岸端已收不能替它核销）
+    assert [item["id"] for item in svc.list_candidates(report_id=report_id, target="科研归档端")] == [9102]
